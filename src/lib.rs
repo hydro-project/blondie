@@ -7,6 +7,7 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+use crossbeam_skiplist::SkipMap;
 use object::Object;
 use windows::core::{GUID, PCSTR, PSTR};
 use windows::Win32::Foundation::{
@@ -45,34 +46,36 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr::{addr_of, addr_of_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Weak};
 
 /// map[array_of_stacktrace_addrs] = sample_count
 type StackMap = rustc_hash::FxHashMap<[u64; MAX_STACK_DEPTH], u64>;
-struct TraceContext {
+
+struct ProcessTraceContext {
+    /// SAFETY: must be a valid process handle
     target_process_handle: HANDLE,
     stack_counts_hashmap: StackMap,
+    /// SAFETY: must be the id of the process
     target_proc_pid: u32,
-    trace_running: AtomicBool,
     show_kernel_samples: bool,
 
     /// (image_path, image_base, image_size)
     image_paths: Vec<(OsString, u64, u64)>,
 }
-impl TraceContext {
-    /// The Context takes ownership of the handle.
+impl ProcessTraceContext {
+    /// This takes ownership of the handle.
     /// SAFETY:
-    ///  - target_process_handle must be a valid process handle.
-    ///  - target_proc_id must be the id of the process.
+    ///  - `target_process_handle` must be a valid process handle.
+    ///  - `target_proc_id must` be the id of the process.
     unsafe fn new(
         target_process_handle: HANDLE,
         target_proc_pid: u32,
         kernel_stacks: bool,
-    ) -> Result<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             target_process_handle,
             stack_counts_hashmap: Default::default(),
             target_proc_pid,
-            trace_running: AtomicBool::new(false),
             show_kernel_samples: std::env::var("BLONDIE_KERNEL")
                 .map(|value| {
                     let upper = value.to_uppercase();
@@ -80,20 +83,37 @@ impl TraceContext {
                 })
                 .unwrap_or(kernel_stacks),
             image_paths: Vec::with_capacity(1024),
-        })
+        }
     }
 }
-impl Drop for TraceContext {
+impl Drop for ProcessTraceContext {
     fn drop(&mut self) {
-        // SAFETY: TraceContext invariants ensure these are valid
+        // SAFETY: ProcessTraceContext invariants ensure these are valid
         unsafe {
             let ret = CloseHandle(self.target_process_handle);
             if ret.0 == 0 {
-                panic!("TraceContext::CloseHandle error:{:?}", get_last_error(""));
+                panic!(
+                    "ProcessTraceContext::CloseHandle error:{:?}",
+                    get_last_error("")
+                );
             }
         }
     }
 }
+
+struct TraceContext {
+    trace_running: AtomicBool,
+    process_contexts: SkipMap<u32, ProcessContext>,
+}
+fn get_global_trace_context() -> Arc<TraceContext> {
+    static GLOBAL_TRACE_CONTEXT: Mutex<Weak<TraceContext>> = Mutex::new(Weak::new());
+    let locked = GLOBAL_TRACE_CONTEXT.lock().unwrap();
+
+    if let Some(arc) = locked.upgrade() {
+        arc.image_paths_by_proc_id.insert(key, value)
+    }
+}
+
 // msdn says 192 but I got some that were bigger
 //const MAX_STACK_DEPTH: usize = 192;
 const MAX_STACK_DEPTH: usize = 200;
@@ -346,20 +366,23 @@ unsafe fn trace_from_process_id(
     }
 
     let target_proc_handle = handle_from_process_id(target_process_id)?;
-    let mut context = TraceContext::new(target_proc_handle, target_process_id, kernel_stacks)?;
-    //TODO: Do we need to Box the context?
+    let mut context_raw: *const TraceContext = Box::into_raw(Box::new(TraceContext::new(
+        target_proc_handle,
+        target_process_id,
+        kernel_stacks,
+    )?));
 
     let mut log = EVENT_TRACE_LOGFILEA::default();
     log.LoggerName = PSTR(kernel_logger_name_with_nul.as_mut_ptr());
     log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
         | PROCESS_TRACE_MODE_EVENT_RECORD
         | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
-    log.Context = addr_of_mut!(context).cast();
+    log.Context = context_raw.cast_mut().cast();
 
     unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
         let provider_guid_data1 = (*record).EventHeader.ProviderId.data1;
         let event_opcode = (*record).EventHeader.EventDescriptor.Opcode;
-        let context = &mut *(*record).UserContext.cast::<TraceContext>();
+        let context = &*(*record).UserContext.cast_const().cast::<TraceContext>();
         context.trace_running.store(true, Ordering::Relaxed);
 
         const EVENT_TRACE_TYPE_LOAD: u8 = 10;
@@ -501,7 +524,7 @@ unsafe fn trace_from_process_id(
     });
 
     // Wait until we know for sure the trace is running
-    while !context.trace_running.load(Ordering::Relaxed) {
+    while !context_raw.trace_running.load(Ordering::Relaxed) {
         std::hint::spin_loop();
     }
     // Resume the suspended process
@@ -522,7 +545,7 @@ unsafe fn trace_from_process_id(
         #[allow(non_snake_case)]
         let NtResumeProcess: extern "system" fn(isize) -> i32 =
             std::mem::transmute(NtResumeProcess);
-        NtResumeProcess(context.target_process_handle.0);
+        NtResumeProcess(context_raw.target_process_handle.0);
     }
 
     // Wait for it to end
@@ -543,12 +566,12 @@ unsafe fn trace_from_process_id(
         return Err(Error::UnknownError);
     }
 
-    if context.show_kernel_samples {
+    if context_raw.show_kernel_samples {
         let kernel_module_paths = list_kernel_modules();
-        context.image_paths.extend(kernel_module_paths);
+        context_raw.image_paths.extend(kernel_module_paths);
     }
 
-    Ok(context)
+    Ok(unsafe { *Box::from_raw(context_raw) })
 }
 
 /// The sampled results from a process execution

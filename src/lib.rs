@@ -105,30 +105,35 @@ impl Drop for ProcessTraceContext {
 struct TraceContext {
     trace_running: AtomicBool,
     procs: SkipMap<u32, ProcessTraceContext>,
-    pt_thread: JoinHandle<()>,
+    /// SAFETY: must be from [`Box::into_raw`].
+    event_trace_props: Box<EVENT_TRACE_PROPERTIES_WITH_STRING>,
+    /// ProcessTrace thread.
+    pt_thread: Option<JoinHandle<()>>,
 }
 impl Drop for TraceContext {
     fn drop(&mut self) {
         // This unblocks `ProcessTrace` in the background thread `pt_thread`.
         let ret = unsafe { ControlTraceA(
             <CONTROLTRACE_HANDLE as Default>::default(),
-            PCSTR(kernel_logger_name_with_nul.as_ptr()),
-            addr_of_mut!(event_trace_props) as *mut _,
+            PCSTR(KERNEL_LOGGER_NAMEA.0), // TODO CHANGED??
+            (&mut *self.event_trace_props as *mut EVENT_TRACE_PROPERTIES_WITH_STRING).cast(),
             EVENT_TRACE_CONTROL_STOP,
         ) };
         if ret != ERROR_SUCCESS {
-            return Err(get_last_error("ControlTraceA STOP ProcessTrace"));
+            // TODO!!
+            panic!("TraceContext DROP: {:?}", get_last_error("ControlTraceA STOP ProcessTrace"));
+            // return Err(get_last_error("ControlTraceA STOP ProcessTrace"));
         }
         // Block until processing thread is done
         // (Safeguard to make sure we don't deallocate the context before the other thread finishes using it)
-        if recvr.recv().is_err() {
-            return Err(Error::UnknownError);
+        if let Err(e) = self.pt_thread.take().unwrap().join() {
+            panic!("TraceContext DROP: {:?}", e);
         }
     }
 }
 static GLOBAL_TRACE_CONTEXT: Mutex<Weak<TraceContext>> = Mutex::new(Weak::new());
 fn get_global_trace_context() -> Result<Arc<TraceContext>> {
-    let locked = GLOBAL_TRACE_CONTEXT.lock().unwrap();
+    let mut locked = GLOBAL_TRACE_CONTEXT.lock().unwrap();
 
     if let Some(running) = locked.upgrade() {
         return Ok(running);
@@ -183,23 +188,8 @@ fn get_global_trace_context() -> Result<Arc<TraceContext>> {
     //  Events are delivered when the buffers are flushed (https://docs.microsoft.com/en-us/windows/win32/etw/logging-mode-constants)
     // We also use Image_Load events to know which dlls to load debug information from for symbol resolution
     // Which is enabled by the EVENT_TRACE_FLAG_IMAGE_LOAD flag
-    const KERNEL_LOGGER_NAMEA_LEN: usize = unsafe {
-        let mut ptr = KERNEL_LOGGER_NAMEA.0;
-        let mut len = 0;
-        while *ptr != 0 {
-            len += 1;
-            ptr = ptr.add(1);
-        }
-        len
-    };
     const PROPS_SIZE: usize = size_of::<EVENT_TRACE_PROPERTIES>() + KERNEL_LOGGER_NAMEA_LEN + 1;
-    #[derive(Clone)]
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    struct EVENT_TRACE_PROPERTIES_WITH_STRING {
-        data: EVENT_TRACE_PROPERTIES,
-        s: [u8; KERNEL_LOGGER_NAMEA_LEN + 1],
-    }
+
     let mut event_trace_props = EVENT_TRACE_PROPERTIES_WITH_STRING {
         data: EVENT_TRACE_PROPERTIES::default(),
         s: [0u8; KERNEL_LOGGER_NAMEA_LEN + 1],
@@ -281,7 +271,12 @@ fn get_global_trace_context() -> Result<Arc<TraceContext>> {
     }
 
     // let target_proc_handle = handle_from_process_id(target_process_id)?;
-    let mut context_raw: *const TraceContext = Box::into_raw(Box::new(TraceContext { trace_running: AtomicBool::new(false), procs: SkipMap::new() }));
+    let mut context_raw: *const TraceContext = Box::into_raw(Box::new(TraceContext {
+        trace_running: AtomicBool::new(false),
+        procs: SkipMap::new(),
+        event_trace_props: Box::new(event_trace_props),
+        pt_thread: None,
+    }));
 
     let mut log = EVENT_TRACE_LOGFILEA::default();
     log.LoggerName = PSTR(kernel_logger_name_with_nul.as_mut_ptr());
@@ -426,72 +421,46 @@ fn get_global_trace_context() -> Result<Arc<TraceContext>> {
         return Err(get_last_error("OpenTraceA processing"));
     }
 
-    let (sender, recvr) = std::sync::mpsc::channel();
     let pt_thread = std::thread::spawn(move || {
-        // This blocks
         unsafe {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            // This blocks
             ProcessTrace(&[trace_processing_handle], None, None);
 
             let ret = CloseTrace(trace_processing_handle);
             if ret != ERROR_SUCCESS {
                 panic!("Error closing trace");
             }
-            sender.send(()).unwrap();
         }
     });
 
     // Wait until we know for sure the trace is running
-    while !(unsafe { *context_raw }).trace_running.load(Ordering::Relaxed) {
+    while !(unsafe { &*context_raw }).trace_running.load(Ordering::Relaxed) {
         std::hint::spin_loop();
     }
 
-    // // Resume the suspended process
-    // if is_suspended {
-    //     // TODO: Do something less gross here
-    //     // std Command/Child do not expose the main thread handle or id, so we can't easily call ResumeThread
-    //     // Therefore, we call the undocumented NtResumeProcess. We should probably manually call CreateProcess.
-    //     // Now that https://github.com/rust-lang/rust/issues/96723 is merged, we could use that on nightly
-    //     let ntdll =
-    //         windows::Win32::System::LibraryLoader::GetModuleHandleA(PCSTR("ntdll.dll\0".as_ptr()))
-    //             .expect("Could not find ntdll.dll");
-    //     #[allow(non_snake_case)]
-    //     let NtResumeProcess = windows::Win32::System::LibraryLoader::GetProcAddress(
-    //         ntdll,
-    //         PCSTR("NtResumeProcess\0".as_ptr()),
-    //     )
-    //     .expect("Could not find NtResumeProcess in ntdll.dll");
-    //     #[allow(non_snake_case)]
-    //     let NtResumeProcess: extern "system" fn(isize) -> i32 =
-    //         std::mem::transmute(NtResumeProcess);
-    //     NtResumeProcess(context_raw.target_process_handle.0);
-    // }
+    unsafe { &mut *context_raw }.pt_thread = Some(pt_thread);
+    let out = Arc::new(unsafe { *context_raw }); //TODO UB
+    *locked = Arc::downgrade(&out);
+    Ok(out)
+}
 
-    // // Wait for it to end
-    // wait_for_process_by_handle(target_proc_handle)?;
-
-    // This unblocks `ProcessTrace`
-    let ret = unsafe { ControlTraceA(
-        <CONTROLTRACE_HANDLE as Default>::default(),
-        PCSTR(kernel_logger_name_with_nul.as_ptr()),
-        addr_of_mut!(event_trace_props) as *mut _,
-        EVENT_TRACE_CONTROL_STOP,
-    ) };
-    if ret != ERROR_SUCCESS {
-        return Err(get_last_error("ControlTraceA STOP ProcessTrace"));
+const KERNEL_LOGGER_NAMEA_LEN: usize = unsafe {
+    let mut ptr = KERNEL_LOGGER_NAMEA.0;
+    let mut len = 0;
+    while *ptr != 0 {
+        len += 1;
+        ptr = ptr.add(1);
     }
-    // Block until processing thread is done
-    // (Safeguard to make sure we don't deallocate the context before the other thread finishes using it)
-    if recvr.recv().is_err() {
-        return Err(Error::UnknownError);
-    }
+    len
+};
 
-    // if context_raw.show_kernel_samples {
-    //     let kernel_module_paths = list_kernel_modules();
-    //     context_raw.image_paths.extend(kernel_module_paths);
-    // }
-
-    // Ok(unsafe { *Box::from_raw(context_raw) })
+#[derive(Clone)]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct EVENT_TRACE_PROPERTIES_WITH_STRING {
+    data: EVENT_TRACE_PROPERTIES,
+    s: [u8; KERNEL_LOGGER_NAMEA_LEN + 1],
 }
 
 // msdn says 192 but I got some that were bigger
@@ -602,311 +571,14 @@ unsafe fn trace_from_process_id(
     target_process_id: u32,
     is_suspended: bool,
     kernel_stacks: bool,
-) -> Result<TraceContext> {
-    let mut winver_info = OSVERSIONINFOA::default();
-    winver_info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOA>() as u32;
-    let ret = GetVersionExA(&mut winver_info);
-    if ret.0 == 0 {
-        return Err(get_last_error("TraceSetInformation interval"));
-    }
-    // If we're not win7 or more, return unsupported
-    // https://docs.microsoft.com/en-us/windows/win32/sysinfo/operating-system-version
-    if winver_info.dwMajorVersion < 6
-        || (winver_info.dwMajorVersion == 6 && winver_info.dwMinorVersion == 0)
-    {
-        return Err(Error::UnsupportedOsVersion);
-    }
-    acquire_privileges()?;
-
-    // Set the sampling interval
-    // Only for Win8 or more
-    if winver_info.dwMajorVersion > 6
-        || (winver_info.dwMajorVersion == 6 && winver_info.dwMinorVersion >= 2)
-    {
-        let mut interval = TRACE_PROFILE_INTERVAL::default();
-        // TODO: Parameter?
-        interval.Interval = (1000000000 / 8000) / 100;
-        let ret = TraceSetInformation(
-            None,
-            // The value is supported on Windows 8, Windows Server 2012, and later.
-            TraceSampledProfileIntervalInfo,
-            addr_of!(interval).cast(),
-            size_of::<TRACE_PROFILE_INTERVAL>() as u32,
-        );
-        if ret != ERROR_SUCCESS {
-            return Err(get_last_error("TraceSetInformation interval"));
-        }
-    }
-
-    let mut kernel_logger_name_with_nul = KERNEL_LOGGER_NAMEA
-        .as_bytes()
-        .iter()
-        .cloned()
-        .chain(Some(0))
-        .collect::<Vec<u8>>();
-    // Build the trace properties, we want EVENT_TRACE_FLAG_PROFILE for the "SampledProfile" event
-    // https://docs.microsoft.com/en-us/windows/win32/etw/sampledprofile
-    // In https://docs.microsoft.com/en-us/windows/win32/etw/event-tracing-mof-classes that event is listed as a "kernel event"
-    // And https://docs.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants says
-    // "The NT Kernel Logger session is the only session that can accept events from kernel event providers."
-    // Therefore we must use GUID SystemTraceControlGuid/KERNEL_LOGGER_NAME as the session
-    // EVENT_TRACE_REAL_TIME_MODE:
-    //  Events are delivered when the buffers are flushed (https://docs.microsoft.com/en-us/windows/win32/etw/logging-mode-constants)
-    // We also use Image_Load events to know which dlls to load debug information from for symbol resolution
-    // Which is enabled by the EVENT_TRACE_FLAG_IMAGE_LOAD flag
-    const KERNEL_LOGGER_NAMEA_LEN: usize = unsafe {
-        let mut ptr = KERNEL_LOGGER_NAMEA.0;
-        let mut len = 0;
-        while *ptr != 0 {
-            len += 1;
-            ptr = ptr.add(1);
-        }
-        len
-    };
-    const PROPS_SIZE: usize = size_of::<EVENT_TRACE_PROPERTIES>() + KERNEL_LOGGER_NAMEA_LEN + 1;
-    #[derive(Clone)]
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    struct EVENT_TRACE_PROPERTIES_WITH_STRING {
-        data: EVENT_TRACE_PROPERTIES,
-        s: [u8; KERNEL_LOGGER_NAMEA_LEN + 1],
-    }
-    let mut event_trace_props = EVENT_TRACE_PROPERTIES_WITH_STRING {
-        data: EVENT_TRACE_PROPERTIES::default(),
-        s: [0u8; KERNEL_LOGGER_NAMEA_LEN + 1],
-    };
-    event_trace_props.data.EnableFlags = EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_IMAGE_LOAD;
-    event_trace_props.data.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    event_trace_props.data.Wnode.BufferSize = PROPS_SIZE as u32;
-    event_trace_props.data.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    event_trace_props.data.Wnode.ClientContext = 3;
-    event_trace_props.data.Wnode.Guid = SystemTraceControlGuid;
-    event_trace_props.data.BufferSize = 1024;
-    let core_count = std::thread::available_parallelism()
-        .unwrap_or(std::num::NonZeroUsize::new(1usize).unwrap());
-    event_trace_props.data.MinimumBuffers = core_count.get() as u32 * 4;
-    event_trace_props.data.MaximumBuffers = core_count.get() as u32 * 6;
-    event_trace_props.data.LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-    event_trace_props
-        .s
-        .copy_from_slice(&kernel_logger_name_with_nul[..]);
-
-    let kernel_logger_name_with_nul_pcstr = PCSTR(kernel_logger_name_with_nul.as_ptr());
-    // Stop an existing session with the kernel logger, if it exists
-    // We use a copy of `event_trace_props` since ControlTrace overwrites it
-    {
-        let mut event_trace_props_copy = event_trace_props.clone();
-        let control_stop_retcode = ControlTraceA(
-            None,
-            kernel_logger_name_with_nul_pcstr,
-            addr_of_mut!(event_trace_props_copy) as *mut _,
-            EVENT_TRACE_CONTROL_STOP,
-        );
-        if control_stop_retcode != ERROR_SUCCESS
-            && control_stop_retcode != ERROR_WMI_INSTANCE_NOT_FOUND
-        {
-            return Err(get_last_error("ControlTraceA STOP"));
-        }
-    }
-
-    // Start kernel trace session
-    let mut trace_session_handle: CONTROLTRACE_HANDLE = Default::default();
-    {
-        let start_retcode = StartTraceA(
-            addr_of_mut!(trace_session_handle),
-            kernel_logger_name_with_nul_pcstr,
-            addr_of_mut!(event_trace_props) as *mut _,
-        );
-        if start_retcode != ERROR_SUCCESS {
-            return Err(get_last_error("StartTraceA"));
-        }
-    }
-
-    // Enable stack tracing
-    {
-        let mut stack_event_id = CLASSIC_EVENT_ID::default();
-        // GUID from https://docs.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants
-        let perfinfo_guid = GUID {
-            data1: 0xce1dbfb4,
-            data2: 0x137e,
-            data3: 0x4da6,
-            data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc],
-        };
-        stack_event_id.EventGuid = perfinfo_guid;
-        stack_event_id.Type = 46; // Sampled profile event
-        let enable_stacks_retcode = TraceSetInformation(
-            trace_session_handle,
-            TraceStackTracingInfo,
-            addr_of!(stack_event_id).cast(),
-            size_of::<CLASSIC_EVENT_ID>() as u32,
-        );
-        if enable_stacks_retcode != ERROR_SUCCESS {
-            return Err(get_last_error("TraceSetInformation stackwalk"));
-        }
-    }
-
+) -> Result<ProcessTraceContext> {
     let target_proc_handle = unsafe { handle_from_process_id(target_process_id)? };
-    let mut context_raw: *const TraceContext = Box::into_raw(Box::new(TraceContext {
-        trace_running: AtomicBool::new(false),
-        process_contexts: SkipMap::new(),
-    }));
+    let proc_ctx = ProcessTraceContext::new(target_proc_handle, target_process_id, kernel_stacks);
 
-    let mut log = EVENT_TRACE_LOGFILEA::default();
-    log.LoggerName = PSTR(kernel_logger_name_with_nul.as_mut_ptr());
-    log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
-        | PROCESS_TRACE_MODE_EVENT_RECORD
-        | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
-    log.Context = context_raw.cast_mut().cast();
+    // Start tracing by adding to tracked processes.
+    let tracing_ctx = get_global_trace_context()?;
+    let entry = tracing_ctx.procs.insert(target_process_id, proc_ctx);
 
-    unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
-        let provider_guid_data1 = (*record).EventHeader.ProviderId.data1;
-        let event_opcode = (*record).EventHeader.EventDescriptor.Opcode;
-        let context = &*(*record).UserContext.cast_const().cast::<TraceContext>();
-        context.trace_running.store(true, Ordering::Relaxed);
-
-        const EVENT_TRACE_TYPE_LOAD: u8 = 10;
-        if event_opcode == EVENT_TRACE_TYPE_LOAD {
-            let event = (*record).UserData.cast::<ImageLoadEvent>().read_unaligned();
-            context.process_contexts
-            if event.ProcessId != context.target_proc_pid {
-                // Ignore dlls for other processes
-                return;
-            }
-            let filename_p = (*record)
-                .UserData
-                .cast::<ImageLoadEvent>()
-                .offset(1)
-                .cast::<u16>();
-            let filename_os_string = OsString::from_wide(std::slice::from_raw_parts(
-                filename_p,
-                ((*record).UserDataLength as usize - size_of::<ImageLoadEvent>()) / 2,
-            ));
-            context.image_paths.push((
-                filename_os_string,
-                event.ImageBase as u64,
-                event.ImageSize as u64,
-            ));
-
-            return;
-        }
-
-        // From https://docs.microsoft.com/en-us/windows/win32/etw/stackwalk
-        let stackwalk_guid_data1 = 0xdef2fe46;
-        let stackwalk_event_type = 32;
-        if event_opcode != stackwalk_event_type || stackwalk_guid_data1 != provider_guid_data1 {
-            // Ignore events other than stackwalk or dll load
-            return;
-        }
-        let ud_p = (*record).UserData;
-        let _timestamp = ud_p.cast::<u64>().read_unaligned();
-        let proc = ud_p.cast::<u32>().offset(2).read_unaligned();
-        let _thread = ud_p.cast::<u32>().offset(3).read_unaligned();
-        if proc != context.target_proc_pid {
-            // Ignore stackwalks for other processes
-            return;
-        }
-
-        let stack_depth_32 = ((*record).UserDataLength - 16) / 4;
-        let stack_depth_64 = stack_depth_32 / 2;
-        let stack_depth = if size_of::<usize>() == 8 {
-            stack_depth_64
-        } else {
-            stack_depth_32
-        };
-
-        let mut tmp = vec![];
-        let mut stack_addrs = if size_of::<usize>() == 8 {
-            std::slice::from_raw_parts(ud_p.cast::<u64>().offset(2), stack_depth as usize)
-        } else {
-            tmp.extend(
-                std::slice::from_raw_parts(
-                    ud_p.cast::<u64>().offset(2).cast::<u32>(),
-                    stack_depth as usize,
-                )
-                .iter()
-                .map(|x| *x as u64),
-            );
-            &tmp
-        };
-        if stack_addrs.len() > MAX_STACK_DEPTH {
-            stack_addrs = &stack_addrs[(stack_addrs.len() - MAX_STACK_DEPTH)..];
-        }
-
-        let mut stack = [0u64; MAX_STACK_DEPTH];
-        stack[..(stack_depth as usize).min(MAX_STACK_DEPTH)].copy_from_slice(stack_addrs);
-
-        let entry = context.stack_counts_hashmap.entry(stack);
-        *entry.or_insert(0) += 1;
-
-        const DEBUG_OUTPUT_EVENTS: bool = false;
-        if DEBUG_OUTPUT_EVENTS {
-            #[repr(C)]
-            #[derive(Debug)]
-            #[allow(non_snake_case)]
-            #[allow(non_camel_case_types)]
-            struct EVENT_HEADERR {
-                Size: u16,
-                HeaderType: u16,
-                Flags: u16,
-                EventProperty: u16,
-                ThreadId: u32,
-                ProcessId: u32,
-                TimeStamp: i64,
-                ProviderId: ::windows::core::GUID,
-                EventDescriptor: windows::Win32::System::Diagnostics::Etw::EVENT_DESCRIPTOR,
-                KernelTime: u32,
-                UserTime: u32,
-                ProcessorTime: u64,
-                ActivityId: ::windows::core::GUID,
-            }
-            #[repr(C)]
-            #[derive(Debug)]
-            #[allow(non_snake_case)]
-            #[allow(non_camel_case_types)]
-            struct EVENT_RECORDD {
-                EventHeader: EVENT_HEADERR,
-                BufferContextAnonymousProcessorNumber: u8,
-                BufferContextAnonymousAlignment: u8,
-                BufferContextAnonymousProcessorIndex: u16,
-                BufferContextLoggerId: u16,
-                ExtendedDataCount: u16,
-                UserDataLength: u16,
-                ExtendedData:
-                    *mut windows::Win32::System::Diagnostics::Etw::EVENT_HEADER_EXTENDED_DATA_ITEM,
-                UserData: *mut ::core::ffi::c_void,
-                UserContext: *mut ::core::ffi::c_void,
-            }
-            eprintln!(
-                "record {:?} {:?} proc:{proc} thread:{_thread}",
-                (*record.cast::<EVENT_RECORDD>()),
-                stack
-            );
-        }
-    }
-    log.Anonymous2.EventRecordCallback = Some(event_record_callback);
-
-    let trace_processing_handle = OpenTraceA(&mut log);
-    if trace_processing_handle.0 == INVALID_HANDLE_VALUE.0 as u64 {
-        return Err(get_last_error("OpenTraceA processing"));
-    }
-
-    let (sender, recvr) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // This blocks
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-        ProcessTrace(&[trace_processing_handle], None, None);
-
-        let ret = CloseTrace(trace_processing_handle);
-        if ret != ERROR_SUCCESS {
-            panic!("Error closing trace");
-        }
-        sender.send(()).unwrap();
-    });
-
-    // Wait until we know for sure the trace is running
-    while !context_raw.trace_running.load(Ordering::Relaxed) {
-        std::hint::spin_loop();
-    }
     // Resume the suspended process
     if is_suspended {
         // TODO: Do something less gross here
@@ -925,33 +597,21 @@ unsafe fn trace_from_process_id(
         #[allow(non_snake_case)]
         let NtResumeProcess: extern "system" fn(isize) -> i32 =
             std::mem::transmute(NtResumeProcess);
-        NtResumeProcess(context_raw.target_process_handle.0);
+        NtResumeProcess(entry.value().target_process_handle.0);
     }
 
     // Wait for it to end
     wait_for_process_by_handle(target_proc_handle)?;
-    // This unblocks ProcessTrace
-    let ret = ControlTraceA(
-        <CONTROLTRACE_HANDLE as Default>::default(),
-        PCSTR(kernel_logger_name_with_nul.as_ptr()),
-        addr_of_mut!(event_trace_props) as *mut _,
-        EVENT_TRACE_CONTROL_STOP,
-    );
-    if ret != ERROR_SUCCESS {
-        return Err(get_last_error("ControlTraceA STOP ProcessTrace"));
-    }
-    // Block until processing thread is done
-    // (Safeguard to make sure we don't deallocate the context before the other thread finishes using it)
-    if recvr.recv().is_err() {
-        return Err(Error::UnknownError);
-    }
 
-    if context_raw.show_kernel_samples {
+    // TODO: Block until processing thread is done
+
+    let mut proc_ctx = proc_ctx;
+    if proc_ctx.show_kernel_samples {
         let kernel_module_paths = list_kernel_modules();
-        context_raw.image_paths.extend(kernel_module_paths);
+        proc_ctx.image_paths.extend(kernel_module_paths);
     }
 
-    Ok(unsafe { *Box::from_raw(context_raw) })
+    Ok(proc_ctx) // TODO
 }
 
 /// The sampled results from a process execution
